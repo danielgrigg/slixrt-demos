@@ -2,44 +2,72 @@
   (:gen-class)
   (:use [slimath core]
         [sliimp core filter sampler film]
-        [sligeom core bounding aggregate transform [intersect :only [ray]]]
+        [sligeom core bounding aggregate transform intersect]
         [slitrace core camera shape prim])
   (:import [sliimp.sampler Sample]
            [sligeom.transform Transform]
-           [sligeom.intersect Ray]))
+           [sligeom.intersect Ray]
+           [slitrace.camera Camera]
+           [java.util.concurrent Executors]))
   
 (set! *warn-on-reflection* true)
 (set! *unchecked-math* true)
 
+(defn synchronous-render [film f] 
+  (let [[x0 y0 x1 y1] (rect-vec (:bounds film))]
+      (doseq [y (range y0 y1) x (range x0 x1) 
+              :let [^Sampler ss (sampler-film film x y)]]
+          (doseq [^Sample s (:samples ss)]        
+            (splat! film (f s)))))
+  (finish-film! film))
+
+(defn batch-pixels [film ^long n]
+  (let [[x0 y0 x1 y1] (rect-vec (:bounds film))]
+    (partition-all n (for [y (range y0 y1) x (range x0 x1)] [x y]))))
+
+(defn parallel-render [film f nthreads npixels-task]
+  (let [ pool (Executors/newFixedThreadPool nthreads)       
+        tasks (map (fn [ps]
+                     (fn []
+                       (time
+                       (doseq [[x y] ps 
+                               :let [^Sampler sampler (sampler-film film x y)]]
+                              (doseq [^Sample s (:samples sampler) ]
+                                (splat! film (f s)))))))
+                   (batch-pixels film npixels-task))]
+    (doseq [future (.invokeAll pool tasks)]
+      (.get future))
+    (.shutdown pool)
+    (finish-film! film)))
+
+(defn make-world [t]
+  (group (compose (translate 0 0 -0)
+                  (rotate [0 0 1] t))
+        (->> (for [y (range -2 3) x (range -2 3)] (translate x y 0))
+            (map #(instance % (sphere 0.3))
+                 ))))
+
+
 (def ^:dynamic *world-transform* (compose (translate -0 -0 -6)
-                                          (rotate [1 1 0] 1.1)))
-(def ^:dynamic *projection* (perspective :fov-rads (Math/toRadians 38.) 
-                                         :aspect 1.0 
-                                         :near 1.0 
-                                         :far 100.0))
+                                          ;(rotate [1 1 0] 1.1)
+                                          ))
+(def ^:dynamic *grid* (grid (bbox (point3 -1 -1 -1) (point3 1 1 1)) 256))
 
-;(def ^:dynamic *world* (instance (translate 0 0 0)  (sphere 1.0)))
-
-(def ^:dynamic *world* (instance (compose (translate -0 -0 -0)
-                                          (rotate [1 1 0] 0.0))
-                                            (bbox (point3 -1 -1 -1) (point3 1 1 1))))
-
-(def ^:dynamic *grid* (grid3 (bbox (point3 -1 -1 -1) (point3 1 1 1)) 256))
-
-(defn ^Ray world-ray-from-sample [^Transform SP ^Sample s]
-  (let [^Ray r-camera (camera-ray (:x-film s) (:y-film s) SP)
+(defn ^Ray world-ray-from-sample [camera ^Sample s]
+  (let [^Transform SP (screen-projection-transform camera)
+        ^Ray r-camera (camera-ray (:x-film s) (:y-film s) SP)
         ^Ray r-world (transform r-camera (inverse *world-transform*))]
     r-world))
 
-(defn radiance [^Transform SP ^Sample s] 
-  (if-let [[t p n] (trace *world* (world-ray-from-sample SP s)) ]
+(defn radiance [world ^Camera c ^Sample s] 
+  (if-let [[t p n] (trace world (world-ray-from-sample c s)) ]
     (sample s t t t)
     (sample s 0.0 0.0 0.0)))
 
-(defn grid-trace-depth [^Transform SP ^Sample s]
-  (let [r-world (world-ray-from-sample SP s)
+(defn grid-trace-depth [^Camera c ^Sample s]
+  (let [r-world (world-ray-from-sample c s)
         d (:direction r-world)
-        vs (grid3-seq *grid* r-world)
+        vs (grid-seq *grid* r-world)
         n (count vs)
         n' (double (/ n 512))]
 ;    (println "s" s "d" n)
@@ -49,32 +77,23 @@
 
 (defn radiance2 [SP s]
   (sample s 1.0 1.0 0.0))
-  
+
 
 (defn -main
   [& args]
   ;; work around dangerous default behaviour in Clojure
   (alter-var-root #'*read-eval* (constantly false))
 
-  (when-let [^Film F (film :bounds (rect :width 1024 :height 1024) 
+  (let [[t nthreads n] (map read-string (take 3 args))
+        ^Film F (film :bounds (rect :width 1024 :height 1024) 
                       :filter (gaussian)
-                      :finished-f #(spit-film! % "/tmp/slixrt.exr")
+                      :finished-f #(spit-film! % (str "/tmp/s-" t ".exr"))
                       :sampler-f stratified-seq2
-                      :samples-per-pixel 2)]
-    (println "objdraw\n")
-    (let [[x0 y0 x1 y1] (rect-vec (:bounds F))
-          sf (partial (:sampler-f F) (:samples-per-pixel F))
-          S (screen-transform (width F) (height F))
-          P (perspective :fov-rads (Math/toRadians 38.) 
-                         :aspect (double (/ (width F) (height F))) 
-                         :near 1.0 
-                         :far 100.0)
-          SP (compose S P)
-;          radiance-f (partial radiance SP)
-          radiance-f (partial grid-trace-depth SP)]
-      (doseq [y (range y0 y1) x (range x0 x1)]
-        (let [^Sampler ss (sf x y)]
-          (doseq [^Sample s (:samples ss)]        
-            (splat! F (radiance-f s))))))
-    (finish-film! F)))
+                      :samples-per-pixel 9)
+             ^Camera C (perspective-camera 
+                        {:width (long (width F)) :height (long (height F))} )]
+    (println "objdraw " t (* (width F) (height F)) "pixels")
+    (synchronous-render F (partial radiance (make-world t) C))
+    ))
+;    (parallel-render F C grid-trace-depth nthreads n)))
 
