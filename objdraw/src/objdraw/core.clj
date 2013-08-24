@@ -13,6 +13,72 @@
 (set! *warn-on-reflection* true)
 (set! *unchecked-math* true)
 
+(defn- parse-float [^String x] (Float/parseFloat x))
+(defn- parse-int [^String x] (Integer/parseInt x))
+(defn- parse-triple [xs t] (apply vector-of t (map parse-float xs)))
+  
+(defn- parse-vertex-index [^String face-index]
+  (apply vector-of :int 
+         (map parse-int (re-seq #"\d+" face-index))))
+
+(defmulti parse-tokens (fn [tokens] (first tokens)))
+
+(defmethod parse-tokens "#" [params] 
+  [:comment (->> (rest params) (interpose \space) (apply str))])
+
+(defmethod parse-tokens "v" [params]
+  [:vertices (parse-triple (rest params) :float)])
+
+(defmethod parse-tokens "vt" [params]
+  [:uvs (parse-triple (rest params) :float)])
+
+(defmethod parse-tokens "vn" [params]
+  [:normals (parse-triple (rest params) :float)])
+
+(defmethod parse-tokens "f" [params]
+  [:faces (vec (map parse-vertex-index (rest params)))])
+
+(defmethod parse-tokens "g" [params]
+  [:groups (rest params)])
+
+(defmethod parse-tokens "mtllib" [params]
+  [:mtllib (rest params)])
+
+(defmethod parse-tokens "usemtl" [params]
+  [:usemtl (rest params)])
+
+(defmethod parse-tokens "s" [params]
+  [:shading-mode (rest params)])
+
+(defmethod parse-tokens :default [params]
+  [:unknown (apply str (interpose \space params))])
+
+(defn parse-line 
+  "Parse a single line. If a map m is supplied, accumulate the 
+parse into it."
+  ([^String line]   (parse-tokens (re-seq #"\S+" line)))
+  ([m ^String line]
+     (let [[k v] (parse-line line)]
+       (update-in m [k] conj v))))
+
+(defn lines [^String s]
+    (remove clojure.string/blank? (clojure.string/split-lines s)))
+
+(defn model 
+  ([]
+     {:vertices [] :faces [] :ignored []})
+([name]
+   (with-open [rdr (java.io.BufferedReader. 
+                    (java.io.FileReader. name))]
+     (reduce  parse-line-into (model) (line-seq rdr)))))
+
+(defn model-flatten [{:keys [vertices faces] :as m}]
+  (let [de-index (partial nth vertices)
+        faces' (for [f faces :let [f' (map dec f)]]
+                 (map de-index f'))]
+    (assoc-in m [:faces] faces')))
+
+
 (defn synchronous-render [film f] 
   (let [[x0 y0 x1 y1] (rect-vec (:bounds film))]
       (doseq [y (range y0 y1) x (range x0 x1) 
@@ -41,9 +107,12 @@
     (finish-film! film)))
 
 (defn make-world [t]
-  (group (compose (translate 0 0 -0)
-                  (rotate [0 0 1] t))
-        (->> (for [y (range -2 3) x (range -2 3)] (translate x y 0))
+  (group (compose (translate 0 0 -5)
+                  (rotate [1 0.3 1] t))
+        (->> (for [y (range -2 3) 
+                   x (range -2 3)
+                   z (range -2 3)] 
+               (translate x y z))
             (map #(instance % (sphere 0.3))
                  ))))
 
@@ -60,8 +129,8 @@
     r-world))
 
 (defn radiance [world ^Camera c ^Sample s] 
-  (if-let [[t p n] (trace world (world-ray-from-sample c s)) ]
-    (sample s t t t)
+  (if-let [[t p [nx ny nz]] (trace world (world-ray-from-sample c s)) ]
+    (sample s nx ny nz)
     (sample s 0.0 0.0 0.0)))
 
 (defn grid-trace-depth [^Camera c ^Sample s]
@@ -84,12 +153,12 @@
   ;; work around dangerous default behaviour in Clojure
   (alter-var-root #'*read-eval* (constantly false))
 
-  (let [[t nthreads n] (map read-string (take 3 args))
-        ^Film F (film :bounds (rect :width 1024 :height 1024) 
-                      :filter (gaussian)
+  (let [[t w n] (map read-string (take 3 args))
+        ^Film F (film :bounds (rect :width w :height w) 
+                      :filter (tent)
                       :finished-f #(spit-film! % (str "/tmp/s-" t ".exr"))
                       :sampler-f stratified-seq2
-                      :samples-per-pixel 9)
+                      :samples-per-pixel 2)
              ^Camera C (perspective-camera 
                         {:width (long (width F)) :height (long (height F))} )]
     (println "objdraw " t (* (width F) (height F)) "pixels")
