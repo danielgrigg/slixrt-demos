@@ -13,13 +13,16 @@
 (set! *warn-on-reflection* true)
 (set! *unchecked-math* true)
 
+(defn triangulate-face 
+  ([v0 v1 v2] (concat v0 v1 v2))
+  ([v0 v1 v2 v3] (concat v0 v1 v2 v0 v2 v3)))
+
 (defn- parse-float [^String x] (Float/parseFloat x))
 (defn- parse-int [^String x] (Integer/parseInt x))
 (defn- parse-triple [xs t] (apply vector-of t (map parse-float xs)))
   
-(defn- parse-vertex-index [^String face-index]
-  (apply vector-of :int 
-         (map parse-int (re-seq #"\d+" face-index))))
+(defn parse-vertex-index [^String face-index]
+  (map parse-int (re-seq #"\d+" face-index)))
 
 (defmulti parse-tokens (fn [tokens] (first tokens)))
 
@@ -27,16 +30,16 @@
   [:comment (->> (rest params) (interpose \space) (apply str))])
 
 (defmethod parse-tokens "v" [params]
-  [:vertices (parse-triple (rest params) :float)])
+  [:vertices (point3 (parse-triple (rest params) :float))])
 
 (defmethod parse-tokens "vt" [params]
   [:uvs (parse-triple (rest params) :float)])
 
 (defmethod parse-tokens "vn" [params]
-  [:normals (parse-triple (rest params) :float)])
+  [:normals (vector3 (parse-triple (rest params) :float))])
 
 (defmethod parse-tokens "f" [params]
-  [:faces (vec (map parse-vertex-index (rest params)))])
+  [:faces (apply triangulate-face (map parse-vertex-index (rest params)))])
 
 (defmethod parse-tokens "g" [params]
   [:groups (rest params)])
@@ -65,21 +68,45 @@ parse into it."
     (remove clojure.string/blank? (clojure.string/split-lines s)))
 
 (defn model 
-  ([]
-     {:vertices [] :faces [] :ignored []})
+  ([] (zipmap [:vertices :uvs :normals :faces :ignored] (repeat [])))
 ([name]
    (with-open [rdr (java.io.BufferedReader. 
                     (java.io.FileReader. name))]
-     (reduce  parse-line-into (model) (line-seq rdr)))))
+     (reduce parse-line (model) (line-seq rdr)))))
 
-(defn model-flatten [{:keys [vertices faces] :as m}]
-  (let [de-index (partial nth vertices)
-        faces' (for [f faces :let [f' (map dec f)]]
-                 (map de-index f'))]
-    (assoc-in m [:faces] faces')))
+(defn nattributes [{:keys [vertices normals uvs]}]
+  (->> [vertices normals uvs]
+       (filter (complement empty?))
+       count))
 
+(defn attribute-offset
+  "Offsets for attribute attrib in model m"
+ [attrib {:keys [vertices normals uvs faces] :as m}]
+  (let [[v u n] (map not-empty [vertices uvs normals])]
+     (->> (cond (and v u n) {:vertices 0 :uvs 1 :normals 2}
+           (and v n) {:vertices 0 :normals 1}
+           (and v u) {:vertices 0 :uvs 1})
+         attrib)))
 
-(defn synchronous-render [film f] 
+(defn attribute-indices
+  "Indices for attribute attrib in model m"
+  [attrib {:keys [vertices normals uvs faces] :as m}]
+  (let [unweave (fn [offset step xs] (take-nth step (drop offset xs)))
+        offset (attribute-offset attrib m) ]        
+    (if offset 
+      (map (partial unweave offset (nattributes m)) faces ))))
+
+(defn flatten-attribute [attrib m]
+  (->> (attribute-indices attrib m) 
+         (apply concat )
+         (map (comp (partial nth (attrib m)) dec))))
+
+(defn flatten-model [m]
+  (assoc m :vertices (flatten-attribute :vertices m)
+         :normals (flatten-attribute :normals m)
+         :uvs (flatten-attribute :uvs m)))
+
+(defn synchronous-render [film f]
   (let [[x0 y0 x1 y1] (rect-vec (:bounds film))]
       (doseq [y (range y0 y1) x (range x0 x1) 
               :let [^Sampler ss (sampler-film film x y)]]
@@ -113,9 +140,20 @@ parse into it."
                    x (range -2 3)
                    z (range -2 3)] 
                (translate x y z))
-            (map #(instance % (sphere 0.3))
+            (map #(instance % (triangle (point3 -0.3 -0.3 0) 
+                                        (point3 0.3 -0.3 0) 
+                                        (point3 0 0.3 0)))
                  ))))
 
+(defn world-from-model [t model-path]
+  (list-group (compose (translate 0 0 -8)
+                  (rotate [1 0.3 1] t))
+         (->> (model model-path)
+              flatten-model
+              :vertices              
+              (partition 3)
+              (map (partial apply triangle))
+              )))
 
 (def ^:dynamic *world-transform* (compose (translate -0 -0 -6)
                                           ;(rotate [1 1 0] 1.1)
@@ -128,8 +166,7 @@ parse into it."
         ^Ray r-world (transform r-camera (inverse *world-transform*))]
     r-world))
 
-(defn radiance [world ^Camera c ^Sample s] 
-  (if-let [[t p [nx ny nz]] (trace world (world-ray-from-sample c s)) ]
+(defn radiance [world ^Camera c ^Sample s]   (if-let [[t p [nx ny nz]] (trace world (world-ray-from-sample c s)) ]
     (sample s nx ny nz)
     (sample s 0.0 0.0 0.0)))
 
@@ -139,7 +176,6 @@ parse into it."
         vs (grid-seq *grid* r-world)
         n (count vs)
         n' (double (/ n 512))]
-;    (println "s" s "d" n)
     (if vs
       (sample s n' n' n')
       (sample s 0.0 0.0 0.0))))
@@ -152,17 +188,16 @@ parse into it."
   [& args]
   ;; work around dangerous default behaviour in Clojure
   (alter-var-root #'*read-eval* (constantly false))
-
   (let [[t w n] (map read-string (take 3 args))
         ^Film F (film :bounds (rect :width w :height w) 
                       :filter (tent)
                       :finished-f #(spit-film! % (str "/tmp/s-" t ".exr"))
-                      :sampler-f stratified-seq2
-                      :samples-per-pixel 2)
+                      :sampler-f uniform-seq2
+                      :samples-per-pixel 1)
              ^Camera C (perspective-camera 
                         {:width (long (width F)) :height (long (height F))} )]
     (println "objdraw " t (* (width F) (height F)) "pixels")
-    (synchronous-render F (partial radiance (make-world t) C))
+    (synchronous-render F (partial radiance (world-from-model t "/tmp/box_pn.obj") C))
     ))
 ;    (parallel-render F C grid-trace-depth nthreads n)))
 
