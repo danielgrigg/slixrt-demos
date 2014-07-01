@@ -134,7 +134,7 @@ parse into it."
     (finish-film! film)))
 
 (defn make-world [t]
-  (group (compose (translate 0 0 -5)
+  (group (compose (translate 0 0 -1)
                   (rotate [1 0.3 1] t))
         (->> (for [y (range -2 3) 
                    x (range -2 3)
@@ -145,21 +145,22 @@ parse into it."
                                         (point3 0 0.3 0)))
                  ))))
 
-(defn world-from-model [t model-path]
-  (list-group (compose (translate 0 0 -8)
-                  (rotate [1 0.3 1] t))
-         (->> (model model-path)
+(defn model-vertices [model-path]
+  (->> (model model-path)
               flatten-model
               :vertices              
               (partition 3)
               (map (partial apply triangle))
-              )))
+              ))
+
+(defn make-world2 [t model-path]
+  (group (compose (translate 0 0 -1)
+                  (rotate [1 0.3 1] t))
+         (model-vertices model-path)))
 
 (def ^:dynamic *world-transform* (compose (translate -0 -0 -6)
                                           ;(rotate [1 1 0] 1.1)
                                           ))
-(def ^:dynamic *grid* (grid (bbox (point3 -1 -1 -1) (point3 1 1 1)) 256))
-
 (defn ^Ray world-ray-from-sample [camera ^Sample s]
   (let [^Transform SP (screen-projection-transform camera)
         ^Ray r-camera (camera-ray (:x-film s) (:y-film s) SP)
@@ -170,19 +171,8 @@ parse into it."
     (sample s nx ny nz)
     (sample s 0.0 0.0 0.0)))
 
-(defn grid-trace-depth [^Camera c ^Sample s]
-  (let [r-world (world-ray-from-sample c s)
-        d (:direction r-world)
-        vs (grid-seq *grid* r-world)
-        n (count vs)
-        n' (double (/ n 512))]
-    (if vs
-      (sample s n' n' n')
-      (sample s 0.0 0.0 0.0))))
-
 (defn radiance2 [SP s]
   (sample s 1.0 1.0 0.0))
-
 
 (defn -main
   [& args]
@@ -192,12 +182,12 @@ parse into it."
         ^Film F (film :bounds (rect :width w :height w) 
                       :filter (tent)
                       :finished-f #(spit-film! % (str "/tmp/s-" t ".exr"))
-                      :sampler-f uniform-seq2
-                      :samples-per-pixel 1)
+                      :sampler-f stratified-seq2
+                      :samples-per-pixel 9)
              ^Camera C (perspective-camera 
                         {:width (long (width F)) :height (long (height F))} )]
     (println "objdraw " t (* (width F) (height F)) "pixels")
-    (synchronous-render F (partial radiance (world-from-model t "/tmp/box_pn.obj") C))
+    (synchronous-render F (partial radiance (make-world2 t "/tmp/a/helix.obj") C))
     ))
 ;    (parallel-render F C grid-trace-depth nthreads n)))
 
